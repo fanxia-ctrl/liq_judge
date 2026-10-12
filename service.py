@@ -223,7 +223,8 @@ class Runner:
         job = self.store.job(jid)
         opts = json.loads(job["options"])
         self.running = jid
-        self.store.set(jid, status="running", started=job["started"] or time.time())
+        self.store.set(jid, status="running", started=job["started"] or time.time(),
+                       meta=json.dumps({"rubric": judge.rubric_fingerprint(), "endpoint": self.llm.name}, ensure_ascii=False))
         futs = {self.pool.submit(judge.judge_turn, t, self.llm, self.cache, opts["samples"],
                                  opts.get("tool_name") or judge.LIQ_TOOL): i
                 for i, t in self.store.pending(jid)}
@@ -291,8 +292,10 @@ class App:
         return {"id": j["id"], "status": j["status"], "progress": {"done": self.store.done_count(j["id"]), "total": j["total"]},
                 "queue_position": self.store.queue_position(j["id"]), "options": json.loads(j["options"]),
                 "warnings": json.loads(j["warnings"]), "created": iso(j["created"]), "started": iso(j["started"]),
-                "finished": iso(j["finished"]), "error": j["error"], "rubric": judge.rubric_fingerprint(),
-                "endpoint": self.llm.name, "summary": meta.get("summary") or judge.summarize(self.store.results(j["id"]))}
+                "finished": iso(j["finished"]), "error": j["error"],
+                # 已完成的任务报判定时记下的版本；判据改过之后，旧任务仍显示它当时用的那一版
+                "rubric": meta.get("rubric") or judge.rubric_fingerprint(), "endpoint": meta.get("endpoint") or self.llm.name,
+                "summary": meta.get("summary") or judge.summarize(self.store.results(j["id"]))}
 
     def owner(self, headers) -> str | None:
         auth = headers.get("Authorization") or ""

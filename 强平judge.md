@@ -58,6 +58,14 @@ Dify `/v1/chat-messages` 以 streaming 模式返回的事件里，各字段这�
 | `asked_at` | — | 发请求的时间。线上日志里取这条用户消息的发送时间 |
 | `route` | `node_finished`，`title` 为 `ROUTER` | `outputs.text`，如 `{"topic":"交易与合约|强平"}` |
 
+保存了请求体和原始事件流（一行一个 SSE `data` 的 JSON）时，可以直接用命令转换：
+
+```bash
+python3 liq_judge/cli.py extract-dify --request 请求.json --events 事件流.jsonl -o turn.json
+```
+
+`asked_at` 取请求里最后一条用户消息的时间。回放数据的时间是平移过的，转换时加 `--no-asked-at`；有订单真值时加 `--gold`。
+
 其他来源（Langfuse、网关日志等）按同样的含义去找：用户问题、最终回答、工具调用的名称入参和原始返回、之前的对话、提问时间。
 
 ---
@@ -196,9 +204,11 @@ curl -s $LIQ_JUDGE_URL/v1/jobs/<任务id>/results -H "Authorization: Bearer $LIQ
 # 逐轮结论（一行一轮，便于保存为文件）
 curl -s "$LIQ_JUDGE_URL/v1/jobs/<任务id>/results?format=jsonl" -H "Authorization: Bearer $LIQ_JUDGE_KEY" > results.jsonl
 
-# 汇总报告（Markdown）
+# 汇总报告（Markdown），任务完成后才有，未完成时返回 409
 curl -s $LIQ_JUDGE_URL/v1/jobs/<任务id>/report -H "Authorization: Bearer $LIQ_JUDGE_KEY" > report.md
 ```
+
+任务未完成时也可以取 `results`，返回已经判完的轮次。
 
 ### 其他操作
 
@@ -284,7 +294,7 @@ for r in results:
 | `rubric` | 判据指纹。判定标准调整后会变化 |
 | `endpoint` | judge 所用模型 |
 
-对比两批结果时，请先确认这两个标识一致。任意一个不同，结果之间的差异就可能来自 judge 本身，而不是被测 copilot。
+对比两批结果时，请先确认这两个标识一致。任意一个不同，结果之间的差异就可能来自 judge 本身，而不是被测 copilot。已完成的任务显示的是它判定时用的版本，服务升级后也不会变。
 
 ---
 
@@ -323,22 +333,22 @@ curl -s -X POST "$LIQ_JUDGE_URL/v1/jobs?name=liq-demo" \
 
 那一轮 copilot 把问题分到了「带单」，没有调用强平工具，提交时 `tool_calls` 为空数组，judge 记为路由的问题。
 
-**约 3.5 分钟后任务完成，查询任务状态：**
+**约 5 分钟后任务完成，查询任务状态：**
 
 ```json
 {
-  "id": "20261012-193847-c89296",
+  "id": "20261012-195958-7a3bb2",
   "status": "done",
   "progress": {"done": 11, "total": 11},
-  "rubric": "298b458d11e1",
+  "rubric": "35fcf78f7e4b",
   "endpoint": "glm-5.3",
   "summary": {
     "verdict": {"不通过": 7, "通过": 2, "部分": 2},
     "blame": {"服务": 7, "无": 2, "Agent": 1, "路由": 1},
-    "grounding": {"有出入": 8, "忠实": 3},
+    "grounding": {"有出入": 7, "忠实": 4},
     "event_match": {"一致": 5, "不一致": 5, "不适用": 1},
     "failure_handling": {"不适用": 11},
-    "answers_question": {"部分": 9, "是": 2},
+    "answers_question": {"部分": 8, "是": 2, "否": 1},
     "incomplete": 0
   }
 }
@@ -358,10 +368,10 @@ curl -s -X POST "$LIQ_JUDGE_URL/v1/jobs?name=liq-demo" \
     "failure_handling": "不适用",
     "answers_question": "部分",
     "votes": {"verdict": {"不通过": 3}, "blame": {"服务": 3}, "grounding": {"有出入": 3}},
-    "why": "工具把盈亏 406.515 误判为止损价，客服未对照历史截图核实便照抄，导致对用户「设了止损为何还被强平」的解释在关键事实上完全错误。",
+    "why": "强平事件本身对得上，但工具把截图中的盈亏 406.515 误当成止损价，Agent 未加核对直接转述，导致给用户的解释（止损价远低于强平价）与真值（止损委托价 2711、强平前已撤单）不符，问题主要出在服务层。",
     "issues": [
       {"quote": "但您的止损价设在了406.515，这个价格远低于强平价",
-       "detail": "406.515 是用户此前一笔止盈止损单的盈亏金额（USDT），不是止损价。对话历史 OCR 显示用户的止损委托价为 2,711，高于强平价 2,710.24，且该止损单在强平前 2 秒状态为已撤单。工具把盈亏数字误当止损价，回答原样照抄了这一错误事实。"}
+       "detail": "406.515 是对话历史截图中上一笔止盈止损单的盈亏金额（+406.515 USDT），不是止损价。用户真实的止损委托是记录2：平多-止盈止损，委托价 2711，状态为已撤单。"}
     ],
     "complete": true
   },
@@ -374,7 +384,7 @@ curl -s -X POST "$LIQ_JUDGE_URL/v1/jobs?name=liq-demo" \
     "grounding": "忠实",
     "answers_question": "是",
     "votes": {"verdict": {"通过": 3}, "blame": {"无": 3}, "grounding": {"忠实": 3}},
-    "why": "工具返回的强平事件与订单真值一致（ETH 空 2 笔、触发价 2723.03），客服忠实转述并解释了做空时价格先触及 2723.03 强平价、止损 2734 未及触发。",
+    "why": "工具取到的是用户所问的那次 ETH 空单强平事件（触发价 2723.03、两笔全仓，与订单真值一致），客服忠实转述并解释了强平先于止损触发的机制，回应了用户疑问。",
     "issues": [],
     "complete": true
   }
@@ -390,7 +400,7 @@ curl -s -X POST "$LIQ_JUDGE_URL/v1/jobs?name=liq-demo" \
 
 ## 七、耗时与限制
 
-- **耗时**：默认配置下每轮判定 3 次，单轮约 15 秒到 2.5 分钟，中位约 1 分钟。多轮并行处理（默认并发 4），11 轮约 3.5 分钟，整体约每小时 150～200 轮。
+- **耗时**：默认配置下每轮判定 3 次，单轮约半分钟到 4 分钟，中位 1～2 分钟，模型端点忙时偏慢。多轮并行处理（默认并发 4），11 轮约 3.5～5 分钟，整体约每小时 130～190 轮。
 - **排队**：任务按提交顺序依次处理，前面有较大的任务时需要等待。
 - **稳定性**：judge 后端模型偶尔会出现短时不可用。单次判定失败会重试；一轮多数判定都失败时 `complete` 为 `false`，重新提交即可，已判过的内容有缓存，不会重复调用。
 - **服务重启**：未完成的任务在重启后接着判，已判完的轮次不重判。
@@ -467,5 +477,5 @@ python3 liq_judge/cli.py extract bench/runs/<run_id> --cases bench/cases/online_
 ```
 
 - 回放时对话历史的时间整体平移到回放时刻，`user` 传真实 uid，工具查的是用户本人的订单。
-- 因为时间平移，强平服务按「最近一次」取事件时，常会取到用户原始提问之后才发生的强平。判这类数据时要带上订单真值，或者用原始提问时间作为 `asked_at`。
+- 因为时间平移，强平服务按「最近一次」取事件时，常会取到用户原始提问之后才发生的强平。判这类数据时要带上订单真值（`--gold`），真值里标了哪些订单发生在提问之后。回放用例里的时间已经平移过，不能当作 `asked_at`。
 - 本机访问 Dify 必须走公司 VPN 隧道，脚本会自动找地址为 `10.8.8.x` 的 utun 接口并绑定，找不到会直接报错。

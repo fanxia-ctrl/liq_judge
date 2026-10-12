@@ -6,6 +6,8 @@
     python3 cli.py run turns.jsonl -o out/       本地直接判一批，不经过服务
     python3 cli.py extract <replay_run_dir> --cases <cases.jsonl> [--gold <gold.jsonl>] -o turns.jsonl
                                                  把 liq_replay.py 的回放结果整理成 judge 输入
+    python3 cli.py extract-dify --request req.json --events events.jsonl -o turn.json
+                                                 Dify 的原始请求 + 事件流 → judge 的一轮
     python3 cli.py selftest                      不打模型，跑通输入校验、判定、投票、报告
     python3 cli.py probe                         真调一次模型端点
 """
@@ -88,6 +90,52 @@ def cmd_extract(a) -> int:
         out.append(turn)
     Path(a.out).write_text("".join(json.dumps(t, ensure_ascii=False) + "\n" for t in out), encoding="utf-8")
     print(f"{len(out)} 轮 → {a.out}")
+    return 0
+
+
+def cmd_extract_dify(a) -> int:
+    """Dify /v1/chat-messages 的一次调用 → judge 的一轮。
+    输入两个文件：请求体（含 inputs.conversation_history）和原始事件流（一行一个 SSE data 的 JSON）。"""
+    req = json.loads(Path(a.request).read_text(encoding="utf-8"))
+    events = read_jsonl(Path(a.events))
+    answer, calls, route = "", [], ""
+    for ev in events:
+        e = ev.get("event")
+        if e == "message":
+            answer += ev.get("answer") or ""
+        elif e == "agent_log":
+            d = ev.get("data") or {}
+            if str(d.get("label", "")).startswith("CALL ") and d.get("status") in ("success", "error"):
+                out = (d.get("data") or {}).get("output") or {}
+                calls.append({"name": out.get("tool_call_name") or d["label"][5:],
+                              "input": out.get("tool_call_input"),
+                              "output": _tool_output(str(out.get("tool_response") or "")),
+                              **({"error": d["error"]} if d.get("error") else {})})
+        elif e == "node_finished" and (ev.get("data") or {}).get("title") == "ROUTER":
+            route = str(((ev["data"].get("outputs") or {}).get("text")) or "")
+    hist_raw = (req.get("inputs") or {}).get("conversation_history") or ""
+    try:
+        hist = json.loads(hist_raw) if hist_raw else []
+    except ValueError:
+        hist = [{"role": "user", "content": hist_raw}]
+    query = req.get("query") or ""
+    asked_at = ""
+    if hist and hist[-1].get("role") == "user" and hist[-1].get("content") == query:
+        last = hist.pop()                      # history parser 会把最后一条用户消息当作当前问题，这里同样剥掉
+        if a.asked_at_from_history and last.get("ts"):
+            from datetime import datetime
+            asked_at = datetime.fromtimestamp(int(last["ts"])).strftime("%Y-%m-%d %H:%M:%S")
+    turn = {"case_id": a.case_id or req.get("user") or "t0001", "query": query, "answer": answer.strip(),
+            "history": [{"role": m.get("role"), "content": m.get("content")} for m in hist],
+            "tool_calls": calls, "route": route.replace('{"topic":"', "").rstrip('"}')}
+    if asked_at:
+        turn["asked_at"] = asked_at
+    if a.gold:
+        g = {r["uid"]: r for r in read_jsonl(Path(a.gold))}.get(str(req.get("user")))
+        if g:
+            turn["truth"] = {"facts": g.get("facts", []), "orders": g.get("orders", "")}
+    Path(a.out).write_text(json.dumps(turn, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"→ {a.out}  工具调用 {len(calls)} 次，回答 {len(turn['answer'])} 字，历史 {len(turn['history'])} 条")
     return 0
 
 
@@ -174,6 +222,15 @@ def main() -> int:
     p.add_argument("--gold")
     p.add_argument("-o", "--out", required=True)
     p.set_defaults(fn=cmd_extract)
+    p = sub.add_parser("extract-dify", help="Dify 原始请求 + 事件流 → judge 的一轮")
+    p.add_argument("--request", required=True)
+    p.add_argument("--events", required=True)
+    p.add_argument("--gold")
+    p.add_argument("--case-id", default="")
+    p.add_argument("--no-asked-at", dest="asked_at_from_history", action="store_false",
+                   help="不从历史最后一条消息的时间推 asked_at（回放数据的时间是平移过的，要加这个）")
+    p.add_argument("-o", "--out", required=True)
+    p.set_defaults(fn=cmd_extract_dify)
     sub.add_parser("selftest").set_defaults(fn=cmd_selftest)
     sub.add_parser("probe").set_defaults(fn=cmd_probe)
     a = ap.parse_args()
