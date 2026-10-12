@@ -144,7 +144,7 @@ python3 cli.py extract-dify --request 请求.json --events 事件流.jsonl -o tu
 
 | | |
 |---|---|
-| 服务地址 | `http://<dev4 地址>:8788`（部署到 dev4 后填写） |
+| 服务地址（公网） | `http://156.232.94.192:8788` |
 | 访问凭证 | 请向服务维护人申请 API key |
 
 除健康检查外，所有请求都需要携带请求头 `Authorization: Bearer <你的 key>`。每个 key 只能查看自己提交的任务。
@@ -152,7 +152,7 @@ python3 cli.py extract-dify --request 请求.json --events 事件流.jsonl -o tu
 以下示例先设置两个环境变量：
 
 ```bash
-export LIQ_JUDGE_URL=http://<dev4 地址>:8788
+export LIQ_JUDGE_URL=http://156.232.94.192:8788
 export LIQ_JUDGE_KEY=<你的 key>
 ```
 
@@ -229,7 +229,7 @@ curl -s $LIQ_JUDGE_URL/v1/rubric -H "Authorization: Bearer $LIQ_JUDGE_KEY"
 import time
 import requests
 
-URL = "http://<dev4 地址>:8788"
+URL = "http://156.232.94.192:8788"
 HEADERS = {"Authorization": "Bearer <你的 key>"}
 
 with open("turns.jsonl", "rb") as f:
