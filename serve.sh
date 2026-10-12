@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 强平 judge 异步服务的启停脚本。放在仓库根目录，在服务器上 git clone 下来，进 liq_judge/ 目录直接用。
+# 强平 judge 异步服务的启停脚本。放在仓库根目录，在服务器上 git clone 下来直接用。
 #
 #   bash serve.sh              启动（已在跑就什么都不做，可以放进 crontab 反复执行）
 #   bash serve.sh stop         停止

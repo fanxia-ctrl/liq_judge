@@ -61,7 +61,7 @@ Dify `/v1/chat-messages` 以 streaming 模式返回的事件里，各字段这�
 保存了请求体和原始事件流（一行一个 SSE `data` 的 JSON）时，可以直接用命令转换：
 
 ```bash
-python3 liq_judge/cli.py extract-dify --request 请求.json --events 事件流.jsonl -o turn.json
+python3 cli.py extract-dify --request 请求.json --events 事件流.jsonl -o turn.json
 ```
 
 `asked_at` 取请求里最后一条用户消息的时间。回放数据的时间是平移过的，转换时加 `--no-asked-at`；有订单真值时加 `--gold`。
@@ -437,10 +437,10 @@ judge 基于大模型判定，存在一定随机性，同一类说法在不同�
 
 ## 九、部署
 
-服务代码在 `voice_agent_v3` 仓库的 `liq_judge/` 目录，标准库实现，只需要 Python 3.9+。
+服务代码在 `liq_judge` 仓库，标准库实现，只需要 Python 3.9+。
 
 ```bash
-git clone git@github.com:fanxia-ctrl/voice_agent_v3.git && cd voice_agent_v3/liq_judge
+git clone git@github.com:fanxia-ctrl/liq_judge.git && cd liq_judge
 cp config.env.example config.env      # 填模型端点的 key；服务器上 JUDGE_IFACE 留空
 bash serve.sh check                   # 第一次先跑：自检 + 真调一次模型端点
 bash serve.sh                         # 后台启动，默认监听 0.0.0.0:8788
@@ -457,7 +457,7 @@ bash serve.sh                         # 后台启动，默认监听 0.0.0.0:8788
 - **调用方的 key**：第一次启动会生成 `service.keys`，一行一个「名字:密钥」，`cat service.keys` 查看。改完 `bash serve.sh restart` 生效。它不进 git。
 - **端口**：默认 8788，与文本 judge 的 8787 错开。改端口：`LIQ_JUDGE_PORT=9000 bash serve.sh`。
 - **常驻**：脚本已做到关掉 SSH 不退、进程崩溃 5 秒后自动拉起。机器重启后自动恢复需要在 crontab 加一行：
-  `*/5 * * * * cd /path/to/voice_agent_v3/liq_judge && bash serve.sh >/dev/null 2>&1`
+  `*/5 * * * * cd /path/to/liq_judge && bash serve.sh >/dev/null 2>&1`
 - **更新**：`git pull && bash serve.sh restart`。
 - **网络**：服务器要能直连 `config.env` 里的模型端点，`bash serve.sh check` 会真调一次；对外开放 8788 端口。
 
@@ -466,6 +466,7 @@ bash serve.sh                         # 后台启动，默认监听 0.0.0.0:8788
 ## 附录：用回放脚本自己生成 trace
 
 没有现成 trace、要对比 copilot 两个版本时，可以用回放脚本把一批会话重放到被测应用上，再整理成 judge 的输入。
+回放脚本和用例在 `voice_agent_v3` 仓库里，下面第一条在 `voice_agent_v3` 目录执行，第二条在本仓库目录执行。
 
 ```bash
 export COPILOT_DIFY_API_KEY=<被测 copilot 应用的 API key>
@@ -473,7 +474,7 @@ python3 text_agent/tools/liq_replay.py --cases bench/cases/online_liq_replay_100
 ```
 
 ```bash
-python3 liq_judge/cli.py extract bench/runs/<run_id> --cases bench/cases/online_liq_replay_1006.jsonl --gold bench/cases/online_liq_gold_1006.jsonl -o turns.jsonl
+python3 cli.py extract <voice_agent_v3>/bench/runs/<run_id> --cases <voice_agent_v3>/bench/cases/online_liq_replay_1006.jsonl --gold <voice_agent_v3>/bench/cases/online_liq_gold_1006.jsonl -o turns.jsonl
 ```
 
 - 回放时对话历史的时间整体平移到回放时刻，`user` 传真实 uid，工具查的是用户本人的订单。
