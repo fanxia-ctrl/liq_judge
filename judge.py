@@ -4,8 +4,10 @@
 输入一轮（字段说明见 强平judge.md「三、输入格式」）：
   query          必须  用户这一轮的问题
   answer         必须  客服最终回答
+  tool_calls     建议  [{"name": ..., "input": {...}, "output": "..."}]，强平工具的调用和原始返回；[] 表示确实没调用
+  evidence_text  可选  agent 当轮看到的材料原文。没有 tool_calls 时当作强平工具的返回来判
   history        建议  对话历史，字符串，或 [{"role": "user"|"assistant", "content": ...}]
-  tool_calls     建议  [{"name": ..., "input": {...}, "output": "..."}]，强平工具的调用和原始返回
+  asked_at       建议  用户提问的时间，如 "2026-10-02 13:40:00"，用来判断工具取到的是不是提问之后的强平
   truth          可选  订单真值：字符串，或 {"facts": [{"item","truth"}], "orders": "..."}
   route          可选  路由分类，如 "交易与合约|强平"
   case_id        可选
@@ -56,6 +58,8 @@ RUBRIC = """你是加密货币交易所客服质检员，只评估「强平」�
 
 你会拿到：用户当前问题、对话历史、该用户的订单真值（可能没有）、工具状态与工具原始返回、客服最终回答。
 订单真值来自交易系统的强平订单，是事实标准；「提问后」标记的订单发生在用户提问之后，不是用户在问的那次。
+给了提问时间时，工具返回的强平事件如果发生在提问时间之后，一定不是用户在问的那次，event_match 填「不一致」，并在 issues 里写明「取到的是提问之后的强平」。
+工具状态为「未提供」时，说明调用方没有给出工具调用信息，不代表没调用：event_match 填「无法判断」，failure_handling 填「不适用」，blame 不能填「路由」，只依据对话历史和订单真值判断回答本身。
 没有订单真值时，以对话历史和工具返回为依据，不要凭常识补全具体数字。
 
 逐项判断：
@@ -166,7 +170,8 @@ class Mock:
     def complete(self, system: str, user: str, temperature: float) -> str:
         failed = "【工具状态】失败" in user
         missing = "【工具状态】未调用" in user
-        return json.dumps({"event_match": "不适用" if (failed or missing) else "一致",
+        unknown = "【工具状态】未提供" in user
+        return json.dumps({"event_match": "无法判断" if unknown else ("不适用" if (failed or missing) else "一致"),
                            "grounding": "忠实", "failure_handling": "如实告知" if failed else "不适用",
                            "answers_question": "是", "verdict": "部分" if missing else "通过",
                            "blame": "路由" if missing else "无", "issues": [], "why": "mock"}, ensure_ascii=False)
@@ -228,15 +233,23 @@ def validate(o) -> dict:
 
 
 # ── 组装输入 ──────────────────────────────────────────────────────────
-def liq_calls(turn: dict) -> list[dict]:
-    return [c for c in (turn.get("tool_calls") or []) if str(c.get("name", "")).startswith(LIQ_TOOL)]
+def liq_calls(turn: dict, prefix: str = LIQ_TOOL) -> list[dict]:
+    return [c for c in (turn.get("tool_calls") or []) if str(c.get("name", "")).startswith(prefix)]
 
 
-def tool_status(turn: dict) -> tuple[str, dict | None]:
-    calls = liq_calls(turn)
-    if not calls:
-        return "未调用", None
-    c = calls[0]
+def tool_status(turn: dict, prefix: str = LIQ_TOOL) -> tuple[str, dict | None]:
+    """正常 / 失败：取第一次强平工具调用判；未调用：给了 tool_calls 但里面没有强平工具；
+    未提供：既没有 tool_calls 字段也没有 evidence_text。没有 tool_calls 但有 evidence_text 时，把材料当工具返回。"""
+    if turn.get("tool_calls") is None:
+        ev = str(turn.get("evidence_text") or "")
+        if not ev.strip():
+            return "未提供", None
+        c = {"name": "(evidence_text)", "input": None, "output": ev}
+    else:
+        calls = liq_calls(turn, prefix)
+        if not calls:
+            return "未调用", None
+        c = calls[0]
     out = str(c.get("output") or "")
     failed = (not out.strip() or "tool invoke error" in out or "分析过程出现错误" in out
               or "[查询失败]" in out or bool(c.get("error")))
@@ -267,10 +280,12 @@ def fmt_truth(t) -> str:
     return "\n".join(parts) or "（未提供）"
 
 
-def build_prompt(turn: dict) -> tuple[str, str]:
-    status, call = tool_status(turn)
+def build_prompt(turn: dict, prefix: str = LIQ_TOOL) -> tuple[str, str]:
+    status, call = tool_status(turn, prefix)
     user = f"""【用户当前问题】
 {turn['query']}
+
+【提问时间】{turn.get('asked_at') or '（未提供）'}
 
 【对话历史】
 {fmt_history(turn.get('history'))}
@@ -281,7 +296,7 @@ def build_prompt(turn: dict) -> tuple[str, str]:
 【工具状态】{status}
 【工具入参】{json.dumps(call.get('input'), ensure_ascii=False)[:600] if call else '（未调用）'}
 【工具原始返回】
-{str(call.get('output') or '')[:4000] if call else '（未调用）'}
+{str(call.get('output') or '')[:4000] if call else ('（调用方没有提供工具信息）' if status == '未提供' else '（未调用）')}
 
 【客服最终回答】
 {turn.get('answer') or '（空）'}"""
@@ -334,22 +349,30 @@ def _vote(values: list[str], field: str) -> str:
     return sorted(tied, key=lambda v: order.index(v) if v in order else 99)[0]
 
 
-def judge_turn(turn: dict, llm, cache: Cache, samples: int = 3) -> dict:
-    """一轮 → 结论。多次采样时每个字段各自投票，打平取更严重的；issues 取与最终结论一致的那次采样。"""
+def judge_turn(turn: dict, llm, cache: Cache, samples: int = 3, tool_prefix: str = LIQ_TOOL) -> dict:
+    """一轮 → 结论。多次采样时每个字段各自投票，打平取更严重的；issues 取与最终结论一致的那次采样。
+    责任层「路由」只在确实没调用强平工具时成立，由代码兜底。"""
     t0 = time.time()
-    user, status = build_prompt(turn)
+    user, status = build_prompt(turn, tool_prefix)
     outs, errs = [], []
     for i in range(samples):
         temp = 0.0 if i == 0 else 0.6
         o, err = cache.call(llm, user, i, temp)
         (outs.append(o) if o else errs.append(err))
     res = {"case_id": turn.get("case_id"), "tool_status": status, "samples": samples,
-           "judged": len(outs), "judge_errors": errs, "complete": len(outs) > samples // 2}
+           "judged": len(outs), "judge_errors": errs, "complete": len(outs) > samples // 2,
+           "undecidable": ["event_match", "failure_handling"] if status == "未提供" else []}
     if not outs:
         res.update({k: None for k in ENUMS})
         res.update({"issues": [], "why": "", "votes": {}})
     else:
         final = {k: _vote([o[k] for o in outs], k) for k in ENUMS}
+        if status == "未调用" and final["verdict"] != "通过":
+            final["blame"] = "路由"
+        elif status != "未调用" and final["blame"] == "路由":
+            final["blame"] = "Agent" if final["grounding"] == "编造" else "服务"
+        if status == "未提供":
+            final["event_match"], final["failure_handling"] = "无法判断", "不适用"
         pick = next((o for o in outs if all(o[k] == final[k] for k in ("verdict", "blame"))), outs[0])
         res.update(final)
         res.update({"issues": pick["issues"], "why": pick["why"],

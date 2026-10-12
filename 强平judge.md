@@ -4,6 +4,7 @@
 回答里的事实有没有出处、工具失败时有没有乱说、有没有回应用户的具体疑问，给出总判定和问题出在哪一层
 （强平服务、客服 Agent、路由），并附回答原文引用和理由。
 
+trace 来自哪里都可以：线上日志、Langfuse、Dify 的事件流、其他系统的对话记录。只要按「二」取出几项内容、整理成一行一轮的文件，就能提交。
 调用方式与文本 judge 服务相同：提交一批轮次，拿到任务 id，轮询，完成后取结果和报告。
 
 > judge 的结论用于辅助人工复核和版本回归对比，不替代人工审核。
@@ -13,61 +14,51 @@
 ## 一、整体流程
 
 ```
-① 回放用例 ──liq_replay.py──▶ 调用被测 copilot（Dify 应用），保留每个节点和 Agent 的工具调用
+① 你的 trace（线上日志、Langfuse、Dify 事件流……）
                                     │
-② ──cli.py extract──▶ 整理成 judge 的输入，得到 turns.jsonl
+② 按「二」取出字段，整理成 turns.jsonl（一行一轮）
                                     │
 ③ ──HTTP POST──▶ 强平 judge 服务 ──▶ 返回任务 id
                                     │
 ④ 轮询任务状态，完成后取结果（逐轮结论、汇总报告）
 ```
 
-①② 在 `voice_agent_v3` 仓库中完成，③④ 调用 judge 服务。
-如果你的数据来自其他渠道（例如线上日志），跳过 ①②，按「三、输入格式」自行整理字段即可。
-
 ---
 
-## 二、准备数据
+## 二、从 trace 里取哪些字段
 
-### 1. 回放一批强平会话
+judge 判定时依据的是「客服这一轮实际看到了什么、说了什么」。不管 trace 来自哪里，取下面几项：
 
-被测对象是文本 copilot（Dify 应用）。回放脚本把每条用例的对话历史带上，以 streaming 方式调用
-`/v1/chat-messages`，记录 ROUTER 的分类、Agent 调用强平工具的入参和原始返回、最终回答。
-
-```bash
-export COPILOT_DIFY_API_KEY=<被测 copilot 应用的 API key>
-python3 text_agent/tools/liq_replay.py --cases bench/cases/online_liq_replay_1006.jsonl
-```
-
-用例文件每行是一条会话：用户 uid、当前问题、原始提问时间、对话历史（不含当前问题）。
-回放时对话历史的时间整体平移到回放时刻，`user` 传真实 uid，工具查的是用户本人的订单。
-
-产物在 `bench/runs/<run_id>/records.jsonl`，一行一轮。
-
-> 本机访问 Dify 必须走公司 VPN 隧道。脚本会自动找地址为 `10.8.8.x` 的 utun 接口并绑定；
-> 找不到会直接报错，请先确认 VPN 已连上。
-
-### 2. 整理成 judge 的输入
-
-```bash
-python3 liq_judge/cli.py extract bench/runs/<run_id> \
-    --cases bench/cases/online_liq_replay_1006.jsonl \
-    --gold  bench/cases/online_liq_gold_1006.jsonl \
-    -o turns.jsonl
-```
-
-生成的 `turns.jsonl` **一行一轮，这就是提交给 judge 的文件**。`--gold` 是订单真值，可省略，但省略后取错事件的问题可能判不出来。
-
-judge 判定时依据的是「客服这一轮实际看到了什么」，所以重点是工具的原始返回，而不仅是问答本身。各字段的来源：
-
-| 字段 | 来源 | 内容 |
+| 要取的内容 | 对应字段 | 说明 |
 |---|---|---|
-| `query` | 用例 | 用户这一轮的问题 |
-| `answer` | 流式回答拼接后的原文 | 客服最终回答 |
-| `history` | 用例 | 对话历史，含截图 OCR，用来确定用户在问哪一次强平 |
-| `tool_calls` | Agent 的 `agent_log` 事件 | 强平工具的名称、入参（`uid`、`content`、`context`）、原始返回 |
-| `truth` | 订单真值文件 | 该用户的强平订单：时间、币种、方向、模式、触发价、平仓盈亏，标出发生在提问之后的订单 |
-| `route` | ROUTER 节点输出 | 这一轮被分到的类别，如 `交易与合约|强平` |
+| 用户这一轮的原话 | `query` | 必须 |
+| 客服最终发给用户的回答 | `answer` | 必须，取最终文本，不是中间步骤 |
+| 强平工具的调用：工具名、入参、**原始返回** | `tool_calls` | 返回要取 agent 收到的原文，不要摘要或截断。这是判断「服务错了还是 Agent 错了」的依据 |
+| 或者：agent 这一轮看到的全部材料 | `evidence_text` | trace 里工具返回和其他材料混在一起、拆不出单次调用时用这个 |
+| 这一轮之前的对话 | `history` | 包括用户发的截图的 OCR 文本。用来确定用户在问哪一次强平 |
+| 用户提问的时间 | `asked_at` | trace 里的消息时间。用来识别工具取到的是提问之后才发生的强平 |
+| 该用户的强平订单 | `truth` | 交易系统里的强平记录。没有也能判，但取错事件、算错数字基本判不出来 |
+
+几点注意：
+
+- **工具调用一次都没有时，传 `"tool_calls": []`**，judge 会判为「没有调用强平工具」，责任层记为路由。
+  **trace 里看不到工具信息时，不要传 `tool_calls`**，judge 会把「事件是否对得上」「工具失败时的处理」两项记为判不了，不会算到路由头上。
+- **工具名**：默认识别名称以 `analyze_deepcoin_liquidation` 开头的调用（含 `_v2` 等版本）。你的系统里工具名不同时，提交时用 `tool_name` 选项指定。
+- **工具返回里的报错**：返回为空、含 `tool invoke error`、`分析过程出现错误` 或以 `[查询失败]` 开头时，判为工具失败，看客服有没有如实告知。
+
+### 以 Dify 文本 copilot 的事件流为例
+
+Dify `/v1/chat-messages` 以 streaming 模式返回的事件里，各字段这样取：
+
+| 字段 | 事件 | 取法 |
+|---|---|---|
+| `answer` | `message` | 各事件的 `answer` 拼接 |
+| `tool_calls` | `agent_log`，`label` 以 `CALL ` 开头且 `status` 为 `success` / `error` | `data.output.tool_call_name`、`tool_call_input`、`tool_response`。`tool_response` 里的 `variable_value` 才是工具返回原文 |
+| `history` | 请求时传入的 `inputs.conversation_history` | 原样带上 |
+| `asked_at` | — | 发请求的时间。线上日志里取这条用户消息的发送时间 |
+| `route` | `node_finished`，`title` 为 `ROUTER` | `outputs.text`，如 `{"topic":"交易与合约|强平"}` |
+
+其他来源（Langfuse、网关日志等）按同样的含义去找：用户问题、最终回答、工具调用的名称入参和原始返回、之前的对话、提问时间。
 
 ---
 
@@ -79,13 +70,14 @@ judge 判定时依据的是「客服这一轮实际看到了什么」，所以�
 |---|---|---|
 | `query` | **必须** | 无法提交 |
 | `answer` | **必须** | 无法提交 |
-| `tool_calls` | 建议提供 | 按「没有调用强平工具」判，责任会落到路由层 |
+| `tool_calls` 或 `evidence_text` | 建议提供 | 两项判不了（记在 `undecidable`）；回答里的数字在材料里找不到出处，容易被判为编造 |
 | `history` | 建议提供 | 无法确定用户在问哪一次强平，「事件是否对得上」判得偏弱 |
+| `asked_at` | 建议提供 | 工具取到提问之后才发生的强平时，只能靠订单真值识别 |
 | `truth` | 建议提供 | 只能对照工具返回和对话历史，工具取错事件、算错数字可能判不出来 |
 | `route` | 可选 | 只做记录，不影响判定 |
 | `case_id` | 可选 | 不提供时按顺序编号为 `t0001`、`t0002`…；提供时同一批内不能重复 |
 
-**`tool_calls` 的写法：**数组，每个元素是一次工具调用。judge 只看名称以 `analyze_deepcoin_liquidation` 开头的调用（含 `_v2` 等版本），取第一次：
+**`tool_calls` 的写法：**数组，每个元素是一次工具调用。judge 只看名称匹配的强平工具调用，取第一次：
 
 ```json
 {"name": "analyze_deepcoin_liquidation_v2",
@@ -93,9 +85,11 @@ judge 判定时依据的是「客服这一轮实际看到了什么」，所以�
  "output": "工具返回的原文"}
 ```
 
-`output` 为空、含 `tool invoke error`、`分析过程出现错误` 或以 `[查询失败]` 开头时，判为工具失败。
+**`evidence_text` 的写法：**字符串，agent 当轮看到的材料原文。只在没有 `tool_calls` 时使用。
 
 **`history` 的写法：**字符串，或 `[{"role": "user" | "assistant", "content": "……"}]`。
+
+**`asked_at` 的写法：**字符串，如 `"2026-10-02 13:40:00"`，北京时间。
 
 **`truth` 的写法：**字符串，或 `{"facts": [{"item": "强平触发价", "truth": "2754.15"}], "orders": "订单表文本"}`。
 
@@ -109,8 +103,8 @@ judge 判定时依据的是「客服这一轮实际看到了什么」，所以�
 任务选项放在 URL 参数中，如 `?name=liq-regression&samples=3`。URL 参数中的任务名建议只用英文、数字和连字符；需要中文名时，改用 `application/json` 格式放在 `options` 里。
 
 ```text
-{"case_id": "liq-001", "query": "50个以太坊13个点就强平了……", "answer": "……", "history": [...], "tool_calls": [...], "truth": {...}}
-{"case_id": "liq-002", "query": "为什么没有强平", "answer": "……", "history": [...], "tool_calls": [...], "truth": {...}}
+{"case_id": "liq-001", "query": "50个以太坊13个点就强平了……", "answer": "……", "history": [...], "tool_calls": [...], "asked_at": "……"}
+{"case_id": "liq-002", "query": "为什么没有强平", "answer": "……", "evidence_text": "……", "asked_at": "……"}
 ```
 
 **`application/json`**：请求体为一个 JSON 对象，轮次放在 `turns` 数组中，任务选项放在 `options` 中。
@@ -118,7 +112,7 @@ judge 判定时依据的是「客服这一轮实际看到了什么」，所以�
 ```json
 {
   "turns": [
-    {"case_id": "liq-001", "query": "……", "answer": "……", "tool_calls": [], "history": [], "truth": {}}
+    {"case_id": "liq-001", "query": "……", "answer": "……", "tool_calls": [], "history": [], "asked_at": "……"}
   ],
   "options": {"name": "十月强平回归", "samples": 3}
 }
@@ -132,6 +126,7 @@ judge 判定时依据的是「客服这一轮实际看到了什么」，所以�
 |---|---|---|
 | `name` | 空 | 任务名称，会出现在报告标题中 |
 | `samples` | 3 | 每轮判定次数（1～5），每个字段各自投票，打平取更严重的结论。设为 1 速度约快三倍，但结果稳定性下降，不建议用于正式对比 |
+| `tool_name` | `analyze_deepcoin_liquidation` | 强平工具的名称前缀。你的系统里工具名不同时指定 |
 
 ---
 
@@ -250,7 +245,7 @@ for r in results:
 
 | 字段 | 取值 | 说明 |
 |---|---|---|
-| `tool_status` | 正常 / 失败 / 未调用 | 强平工具这一轮的状态，由规则判定，不经过模型 |
+| `tool_status` | 正常 / 失败 / 未调用 / 未提供 | 强平工具这一轮的状态，由规则判定，不经过模型。未提供表示调用方没有给工具信息 |
 | `event_match` | 一致 / 不一致 / 无法判断 / 不适用 | 工具返回的强平事件（时间、币种、方向、笔数）是不是用户在问的那一次。只有通用解释时为无法判断；工具失败或未调用为不适用 |
 | `grounding` | 忠实 / 有出入 / 编造 / 不适用 | 回答里的价格、数量、余额、亏损、时间、币种和结论性说法，能否在工具返回、对话历史或订单真值里找到且不矛盾 |
 | `failure_handling` | 如实告知 / 编造 / 不适用 | 工具失败时，回答是否只说暂时无法查询 |
@@ -260,6 +255,7 @@ for r in results:
 | `issues` | 列表 | 每条包含回答原文 `quote` 和说明 `detail`（错在哪、真值是什么） |
 | `why` | 文本 | 一句话结论 |
 | `votes` | 对象 | 多次判定时 `verdict`、`blame`、`grounding` 各自的票数 |
+| `undecidable` | 列表 | 因缺少材料判不了的项。没有工具信息时为 `event_match`、`failure_handling` |
 | `complete` | true / false | 为 `false` 时表示多数判定调用失败，结论仅供参考，原因见 `judge_errors` |
 
 `verdict` 的取值：
@@ -276,7 +272,7 @@ for r in results:
 |---|---|
 | 服务 | 工具返回本身错误或不全（取错事件、只有通用解释、没有数字、超时、报错），回答只是转述 |
 | Agent | 工具返回是对的或已失败，回答却改错数字、编造，或违背工具的结论 |
-| 路由 | 强平问题没有调用强平工具 |
+| 路由 | 强平问题没有调用强平工具（`tool_calls` 为空数组）。由代码判定，没给工具信息时不会记为路由 |
 | 无 | 通过 |
 
 ### 版本标识
@@ -325,7 +321,7 @@ curl -s -X POST "$LIQ_JUDGE_URL/v1/jobs?name=liq-demo" \
      --data-binary @turns.jsonl
 ```
 
-返回的 `warnings` 里有一条：`1 轮没有 tool_calls：按「未调用强平工具」判，责任会落到路由层`。那一轮是 copilot 把问题分到了「带单」，确实没有调用强平工具。
+那一轮 copilot 把问题分到了「带单」，没有调用强平工具，提交时 `tool_calls` 为空数组，judge 记为路由的问题。
 
 **约 3.5 分钟后任务完成，查询任务状态：**
 
@@ -410,7 +406,10 @@ curl -s -X POST "$LIQ_JUDGE_URL/v1/jobs?name=liq-demo" \
 确认服务地址和端口正确。如果本机设置了 HTTP 代理，在 curl 命令中加 `--noproxy '*'`。
 
 **大量轮次 `blame` 为「路由」**
-通常是提交时没有带 `tool_calls`，或工具名称不是以 `analyze_deepcoin_liquidation` 开头。参见「三、输入格式」。
+通常是工具名对不上：你的系统里强平工具不叫 `analyze_deepcoin_liquidation…`，judge 在 `tool_calls` 里找不到它，就当成没调用。提交时用 `tool_name` 指定工具名。
+
+**大量轮次 `undecidable` 不为空，回答被判「编造」**
+提交时既没有 `tool_calls` 也没有 `evidence_text`。judge 看不到客服拿到的材料，回答里的数字找不到出处，只能按编造处理。请从 trace 里补上工具返回原文。
 
 **取错事件却判成通过**
 没有提供 `truth` 时，judge 只能对照工具返回和对话历史，工具取错事件但说得自洽时可能判不出来。正式对比请带上订单真值。
@@ -451,3 +450,22 @@ bash serve.sh                         # 后台启动，默认监听 0.0.0.0:8788
   `*/5 * * * * cd /path/to/voice_agent_v3/liq_judge && bash serve.sh >/dev/null 2>&1`
 - **更新**：`git pull && bash serve.sh restart`。
 - **网络**：服务器要能直连 `config.env` 里的模型端点，`bash serve.sh check` 会真调一次；对外开放 8788 端口。
+
+---
+
+## 附录：用回放脚本自己生成 trace
+
+没有现成 trace、要对比 copilot 两个版本时，可以用回放脚本把一批会话重放到被测应用上，再整理成 judge 的输入。
+
+```bash
+export COPILOT_DIFY_API_KEY=<被测 copilot 应用的 API key>
+python3 text_agent/tools/liq_replay.py --cases bench/cases/online_liq_replay_1006.jsonl
+```
+
+```bash
+python3 liq_judge/cli.py extract bench/runs/<run_id> --cases bench/cases/online_liq_replay_1006.jsonl --gold bench/cases/online_liq_gold_1006.jsonl -o turns.jsonl
+```
+
+- 回放时对话历史的时间整体平移到回放时刻，`user` 传真实 uid，工具查的是用户本人的订单。
+- 因为时间平移，强平服务按「最近一次」取事件时，常会取到用户原始提问之后才发生的强平。判这类数据时要带上订单真值，或者用原始提问时间作为 `asked_at`。
+- 本机访问 Dify 必须走公司 VPN 隧道，脚本会自动找地址为 `10.8.8.x` 的 utun 接口并绑定，找不到会直接报错。

@@ -40,7 +40,8 @@ class BadRequest(ValueError):
 
 
 def parse_options(raw: dict) -> dict:
-    out = {"name": str(raw.get("name") or "")[:80], "samples": 3}
+    out = {"name": str(raw.get("name") or "")[:80], "samples": 3,
+           "tool_name": str(raw.get("tool_name") or judge.LIQ_TOOL).strip()[:80]}
     if raw.get("samples") not in (None, ""):
         try:
             n = int(raw["samples"])
@@ -57,7 +58,7 @@ def parse_turns(raw) -> tuple[list[dict], list[str]]:
         raise BadRequest("没有轮次")
     if len(raw) > MAX_TURNS:
         raise BadRequest(f"一次最多 {MAX_TURNS} 轮，这次 {len(raw)} 轮")
-    turns, seen, miss = [], set(), {"history": 0, "tool_calls": 0, "truth": 0}
+    turns, seen, miss = [], set(), {"history": 0, "tool": 0, "truth": 0, "asked_at": 0}
     for i, t in enumerate(raw, 1):
         if not isinstance(t, dict):
             raise BadRequest(f"第 {i} 轮不是 JSON 对象")
@@ -72,17 +73,21 @@ def parse_turns(raw) -> tuple[list[dict], list[str]]:
         tc = t.get("tool_calls")
         if tc is not None and not isinstance(tc, list):
             raise BadRequest(f"第 {i} 轮的 tool_calls 必须是数组")
-        for k in miss:
+        if tc is None and not str(t.get("evidence_text") or "").strip():
+            miss["tool"] += 1
+        for k in ("history", "truth", "asked_at"):
             if not t.get(k):
                 miss[k] += 1
         turns.append({**t, "case_id": cid})
     warnings = []
-    if miss["tool_calls"]:
-        warnings.append(f"{miss['tool_calls']} 轮没有 tool_calls：按「未调用强平工具」判，责任会落到路由层")
+    if miss["tool"]:
+        warnings.append(f"{miss['tool']} 轮既没有 tool_calls 也没有 evidence_text：事件是否对得上、工具失败时的处理两项判不了，记在 undecidable 里")
     if miss["history"]:
         warnings.append(f"{miss['history']} 轮没有 history：无法确定用户在问哪一次强平，事件是否对得上会判得偏弱")
     if miss["truth"]:
         warnings.append(f"{miss['truth']} 轮没有 truth：没有订单真值，只能对照工具返回和对话历史，取错事件可能判不出来")
+    if miss["asked_at"]:
+        warnings.append(f"{miss['asked_at']} 轮没有 asked_at：工具取到提问之后才发生的强平时，只能靠订单真值里的标记识别")
     return turns, warnings
 
 
@@ -219,7 +224,8 @@ class Runner:
         opts = json.loads(job["options"])
         self.running = jid
         self.store.set(jid, status="running", started=job["started"] or time.time())
-        futs = {self.pool.submit(judge.judge_turn, t, self.llm, self.cache, opts["samples"]): i
+        futs = {self.pool.submit(judge.judge_turn, t, self.llm, self.cache, opts["samples"],
+                                 opts.get("tool_name") or judge.LIQ_TOOL): i
                 for i, t in self.store.pending(jid)}
         for f in as_completed(futs):
             self.store.save(jid, futs[f], f.result())
@@ -243,6 +249,7 @@ def report_md(job: dict, turns: list[dict], rows: list[dict | None], meta: dict)
     s = meta["summary"]
     lines = [f"# 强平 judge 报告{('：' + opts['name']) if opts.get('name') else ''}", "",
              f"任务 `{job['id']}` · {len(turns)} 轮 · 每轮判定 {opts['samples']} 次 · 判据 `{meta['rubric']}` · 模型 `{meta['endpoint']}`", "",
+             *([f"{n} 轮缺材料，部分项判不了，见各轮 undecidable", ""] if (n := sum(1 for r in rows if r and r.get('undecidable'))) else []),
              "## 汇总", "", "| 项 | 分布 |", "|---|---|"]
     names = {"verdict": "总判定", "blame": "责任层", "grounding": "回答是否有出处", "event_match": "事件是否对得上",
              "failure_handling": "工具失败时的处理", "answers_question": "是否回应具体疑问"}
