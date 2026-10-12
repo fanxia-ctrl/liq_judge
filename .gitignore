@@ -1,0 +1,5 @@
+config.env
+service.keys
+data/
+__pycache__/
+*.pyc
